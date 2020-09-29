@@ -1,27 +1,110 @@
-const express = require('express');
-const http = require('http');
-const bodyParser = require('body-parser');
-const sendGridClient = require('@sendgrid/mail');
+const express = require("express");
+const http = require("http");
+const sendGridClient = require("@sendgrid/mail");
+const _ = require("lodash");
+const Joi = require("@hapi/joi");
+const moment = require("moment");
+const cors = require("cors");
+const morgan = require("morgan");
+const json = require("morgan-json");
+
+const FROM_EMAIL = process.env.FROM_EMAIL || "mythic47@hotmail.com";
+const PORT = process.env.PORT || 8000;
+
+const debug = (data) => {
+  console.log(
+    JSON.stringify({
+      ts: moment().utc(),
+      source: __filename,
+      ...data,
+    })
+  );
+};
 
 const app = express();
-const server = http.Server(app);
+let now = moment();
 
-const FROM_EMAIL = process.env.FROM_EMAIL || 'info@collegefalafel.com';
+morgan.token("body", (req, res) => JSON.stringify(req.body));
+
+const logFormat = json({
+  method: ":method",
+  url: ":url",
+  status: ":status",
+  length: ":res[content-length]",
+  responseTime: ":response-time",
+  body: ":body",
+});
+
+const isCateringThenRequired = {
+  is: "catering",
+  then: Joi.required(),
+  otherwise: Joi.optional(),
+};
+
+const isCateringThenOptional = {
+  is: "catering",
+  then: Joi.optional(),
+  otherwise: Joi.required(),
+};
+
+const isFeedbackThenRequired = {
+  is: "feedback",
+  then: Joi.required(),
+  otherwise: Joi.optional(),
+};
+
+const isFeedbackThenOptional = {
+  is: "feedback",
+  then: Joi.optional(),
+  otherwise: Joi.required(),
+};
+
+const schema = Joi.object({
+  type: Joi.string().required(),
+  details: Joi.string().when("type", isCateringThenRequired),
+  name: Joi.string().required(),
+  email: Joi.string().required(),
+  phone: Joi.number().when("type", isCateringThenRequired),
+  message: Joi.string().when("type", isFeedbackThenRequired),
+  orderId: Joi.string().when("type", isCateringThenRequired),
+  subtotal: Joi.number().when("type", isCateringThenRequired),
+  total: Joi.number().when("type", isCateringThenRequired),
+  tax: Joi.number().when("type", isCateringThenRequired),
+  specialRequest: Joi.string(),
+});
 
 sendGridClient.setApiKey(process.env.SENDGRID_API_KEY);
 
-server.listen(process.env.PORT || 8000, () => {
-  console.log(`[ server.js ] Listening on port ${server.address().port}`);
+app.listen(PORT, () => {
+  debug({ message: `Listening on port ${PORT}` });
 });
 
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
+app.use(cors());
+app.use(morgan(logFormat));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-app.get('/api/', (req, res) => {
-  res.status(200).send('OK');
+app.get("/", (req, res) => {
+  res.status(200).send("OK");
 });
 
-app.post('/api/send-email', async (req, res) => {
+app.post("/send-email", async (req, res, next) => {
+  try {
+    await schema.validateAsync(req.body);
+    if (req.body.type === "feedback") {
+      await sendFeedbackEmail(req.body);
+    } else {
+      await sendCateringEmails(req.body);
+    }
+    res
+      .status(200)
+      .send(req.body.type === "feedback" ? submissionMarkup : "OK");
+  } catch (error) {
+    next(error);
+  }
+});
+
+async function sendCateringEmails(requestBody) {
   const {
     type,
     details,
@@ -29,136 +112,164 @@ app.post('/api/send-email', async (req, res) => {
     email,
     phone,
     orderId,
-    timestamp,
     subtotal,
+    total,
     tax,
-    specialRequest
-  } = req.body;
+    specialRequest,
+  } = requestBody;
 
-  const message = {
-    to: email || 'nafeu.nasir@gmail.com',
+  const htmlDetailsList = _.join(
+    _.map(_.split(details, "####"), (detail) => `<p>${detail}</p>`),
+    ""
+  );
+  const textDetailsList = _.join(_.split(details, "####"), ",");
+
+  const html = (reciever) => `
+    <html>
+    <head>
+    <title>Collegefalafel Mail</title>
+    </head>
+    <body>
+    ${
+      reciever === "restaurant"
+        ? `
+      <p>You have received a ${type} request from the following:</p>
+    `
+        : `
+      <p>Your catering request with the following information has been submitted to College Falafel. Thank you for your submission, a representative from College Falafel will followup with you soon.</p>
+    `
+    }
+    <table>
+    <tr>
+    <th>Name</th>
+    <th>Email</th>
+    <th>Phone</th>
+    </tr>
+    <tr>
+    <td>${name}</td>
+    <td>${email}</td>
+    <td>${phone}</td>
+    </tr>
+    </table>
+    <p>Order ID: ${orderId}</p>
+    <p>Time of submission: ${now.format("MMMM Do YYYY, h:mm:ss a")}</p>
+    <p>Subtotal: $${subtotal}</p>
+    <p>HST (13%): $${tax}</p>
+    <p>Total: $${total}</p>
+    <p>Order Details:</p>
+    ${htmlDetailsList}
+    <p>Special Request(s):</p>
+    <p>${specialRequest}</p>
+    </body>
+    </html>
+  `;
+
+  const text = (reciever) => `
+    ${
+      reciever === "restaurant"
+        ? `You have received a ${type} request from the following:`
+        : `Your catering request with the following information has been submitted to College Falafel. Thank you for your submission, a representative from College Falafel will followup with you soon.`
+    }
+
+    Name: ${name}
+    Email: ${email}
+    Phone: ${phone}
+    Order ID: ${orderId}
+    Time Of Submission: ${now.format("MMMM Do YYYY, h:mm:ss a")}
+
+    Subtotal: $${subtotal}
+    HST (13%): $${tax}
+    Total: $${total}
+
+    Order Details:
+    ${textDetailsList}
+
+    Special Request(s):
+    ${specialRequest}
+  `;
+
+  const subject = `[ collegefalafel.com ] Catering Request - ${name} | ${orderId}`;
+
+  const inboundEmail = {
+    to: FROM_EMAIL,
     from: FROM_EMAIL,
-    subject: type ? `Request: ${type}` : 'Test API Email',
-    text: `[PLACEHOLDER EMAIL FOR ${type ? type : 'DEVELOPER'}]`,
-    html: `<strong>[PLACEHOLDER EMAIL FOR ${type ? type : 'DEVELOPER'}]</strong>`,
+    subject,
+    text: text("restaurant"),
+    html: html("restaurant"),
   };
 
-  try {
-    await sendGridClient.send(message);
-  } catch (error) {
-    console.log(JSON.stringify({ error }, null, 2));
-  }
+  const outboundEmail = {
+    to: email,
+    from: FROM_EMAIL,
+    subject,
+    text: text("customer"),
+    html: html("customer"),
+  };
 
-  res.status(200).send('OK');
-});
-
-/*
-
-$to = "info@collegefalafel.com";
-$subject = "Request: ".$_POST['type'];
-
-$details_list = explode("####", $_POST['details']);
-
-$message = "
-<html>
-<head>
-<title>Collegefalafel Mail</title>
-</head>
-<body>
-<p>You have received a ".$_POST['type']." request from the following:</p>
-<table>
-<tr>
-<th>Name</th>
-<th>Email</th>
-<th>Phone</th>
-</tr>
-<tr>
-<td>".$_POST['name']."</td>
-<td>".$_POST['email']."</td>
-<td>".$_POST['phone']."</td>
-</tr>
-</table>
-<p>Order ID: ".$_POST['orderId']."</p>
-<p>Time of submission: ".$_POST['timestamp']."</p>
-<p>Subtotal: $".$_POST['subtotal']."</p>
-<p>HST (13%): $".$_POST['tax']."</p>
-<p>Total: $".$_POST['total']."</p>
-<p>Order Details:</p>
-";
-
-foreach ($details_list as &$value) {
-  $message .= "<p>" . $value . "</p>";
+  await sendGridClient.send(outboundEmail);
+  await sendGridClient.send(inboundEmail);
 }
 
-$message .= "
-<p>Special Request(s):</p>
-<p>".$_POST['specialRequest']."</p>
-</body>
-</html>
-";
+async function sendFeedbackEmail(requestBody) {
+  const { type, name, email, message } = requestBody;
 
-// Always set content-type when sending HTML email
-$headers = "MIME-Version: 1.0" . "\r\n";
-$headers .= "Content-type:text/html;charset=UTF-8" . "\r\n";
-$headers .= 'From: '.$_POST['email']. "\r\n";
+  const html = `
+    <html>
+    <head>
+    <title>Collegefalafel Mail</title>
+    </head>
+    <body>
+    <table>
+    <tr>
+    <th>Name</th>
+    <th>Email</th>
+    <th>Message</th>
+    </tr>
+    <tr>
+    <td>${name}</td>
+    <td>${email}"</td>
+    <td>${message}</td>
+    </tr>
+    </table>
+    </body>
+    </html>
+  `;
 
-$result = mail($to,$subject,$message,$headers);
+  const text = `
+    Name: ${name}
+    Email: ${email}
+    Message: ${message}
+  `;
 
-// Confirmation Email
-$to = $_POST['email'];
-$subject = "Catering Request Confirmation";
+  const inboundEmail = {
+    to: FROM_EMAIL,
+    from: FROM_EMAIL,
+    subject,
+    text,
+    html,
+  };
 
-$message = "
-<html>
-<head>
-<title>Collegefalafel Mail</title>
-</head>
-<body>
-<p>Your catering request with the following information has been submitted to College Falafel. Thank you for your submission, a representative from College Falafel will followup with you soon.</p>
-<table>
-<tr>
-<th>Name</th>
-<th>Email</th>
-<th>Phone</th>
-</tr>
-<tr>
-<td>".$_POST['name']."</td>
-<td>".$_POST['email']."</td>
-<td>".$_POST['phone']."</td>
-</tr>
-</table>
-<p>Order ID: ".$_POST['orderId']."</p>
-<p>Time of submission: ".$_POST['timestamp']."</p>
-<p>Subtotal: $".$_POST['subtotal']."</p>
-<p>HST (13%): $".$_POST['tax']."</p>
-<p>Total: $".$_POST['total']."</p>
-<p>Order Details:</p>
-";
-
-foreach ($details_list as &$value) {
-  $message .= "<p>" . $value . "</p>";
+  await sendGridClient.send(inboundEmail);
 }
 
-$message .= "
-<p>Special Request(s):</p>
-<p>".$_POST['specialRequest']."</p>
-</body>
-</html>
-";
-
-// Always set content-type when sending HTML email
-$headers = "MIME-Version: 1.0" . "\r\n";
-$headers .= "Content-type:text/html;charset=UTF-8" . "\r\n";
-$headers .= 'From: info@collegefalafel.com' . "\r\n";
-
-$confirmation = mail($to,$subject,$message,$headers);
-
-if (!$result && !$confirmation) {
-  echo "Catering request was not sent successfully";
-} else {
-  echo "Catering request sent successfully";
-}
-
-?>
-
-*/
+const submissionMarkup = `
+  <html>
+  <style>
+    body {
+      background-color: #eeebce;
+      font-family: sans-serif;
+      font-weight: 100;
+      text-align: center;
+      padding: 20px;
+    }
+  </style>
+  <body>
+    <h2>Thank you for your submission, redirecting to collegefalafel.com in a few seconds...</h2>
+  </body>
+  <script>
+    setTimeout(function() {
+      window.location = "http://collegefalafel.com";
+    }, 3000)
+  </script>
+  </html>
+`;
