@@ -8,7 +8,7 @@ const cors = require("cors");
 const morgan = require("morgan");
 const json = require("morgan-json");
 
-const FROM_EMAIL = process.env.FROM_EMAIL || "mythic47@hotmail.com";
+const FROM_EMAIL = process.env.FROM_EMAIL || "info@collegefalafel.com";
 const PORT = process.env.PORT || 8000;
 
 const debug = (data) => {
